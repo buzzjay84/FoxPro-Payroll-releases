@@ -1,0 +1,94 @@
+name: Build Release from private source
+
+# Lives in the PUBLIC release repo (buzzjay84/FoxPro-Payroll-releases) as
+# .github/workflows/build-from-private.yml. A copy is kept in the private
+# source at .github/release-repo/build-from-private.yml. Actions on a public
+# repository are free, so the installer is built here. The private source
+# (jaybhee84/REA-FOXPRO) is checked out read-only with a deploy key, its core
+# tests run, the installer is built, and it is published to THIS repo's Releases.
+#
+# Started by watch-private.yml when the private source's VERSION changes, or by hand:
+#   gh workflow run build-from-private.yml -R buzzjay84/FoxPro-Payroll-releases -f tag=v1.1.1 -f ref=main
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release to publish, e.g. v1.1.1 (must equal VERSION at ref)'
+        required: true
+        type: string
+      ref:
+        description: 'Branch, tag or commit of the private source to build (default: main)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: jaybhee84/REA-FOXPRO
+  RELEASE_TAG: ${{ github.event.inputs.tag }}
+  SOURCE_REF: ${{ github.event.inputs.ref || 'main' }}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Tag must look like vX.Y.Z
+        shell: pwsh
+        run: if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "'$env:RELEASE_TAG' is not a release tag like v1.1.1" }
+
+      # Read-only deploy key; no credentials are left in the workspace. Logs of a
+      # public repo are public, so nothing here prints source or payroll data.
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Tag must match VERSION, release notes must exist
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag $env:RELEASE_TAG must match VERSION $version." }
+          $notes = "release-notes/$env:RELEASE_TAG.md"
+          if (-not (Test-Path $notes) -or (Get-Item $notes).Length -eq 0) { throw "$notes is missing or empty in the private source." }
+
+      # build-installer.ps1 only accepts Inno Setup 6, whose setups run on Windows 7 SP1+.
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup install failed' }
+          }
+
+      - name: Build app, run core tests, build installer
+        shell: pwsh
+        run: ./modern/build-installer.ps1 -Version $env:RELEASE_TAG.TrimStart('v')
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false  # "release not found" is an expected answer below
+          $repo = "${{ github.repository }}"
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          $setup = "dist/FoxPro-Payroll-Setup-$version.exe"
+          $notes = "release-notes/$env:RELEASE_TAG.md"
+          $draft = gh release view $env:RELEASE_TAG --repo $repo --json isDraft --jq .isDraft 2>$null
+          if ($draft -eq 'false') { throw "$env:RELEASE_TAG is already published; bump VERSION for a new release." }
+          if ($draft -eq 'true') { gh release edit $env:RELEASE_TAG --repo $repo --notes-file $notes }
+          else { gh release create $env:RELEASE_TAG --repo $repo --draft --title "Fox Pro Payroll $version" --notes-file $notes }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the release' }
+          gh release upload $env:RELEASE_TAG $setup --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Upload failed' }
+          gh release edit $env:RELEASE_TAG --repo $repo --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Publish failed' }
